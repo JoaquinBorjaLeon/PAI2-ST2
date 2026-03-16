@@ -14,7 +14,6 @@ import socket
 import ssl
 import json
 import struct
-import sys
 import getpass
 
 
@@ -100,16 +99,16 @@ def connect_to_ssl_server():
     ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
     ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
 
-    # Cargar certificado CA para verificar el servidor
+    # Cargar certificado CA para verificar el servidor (obligatorio)
     try:
         ssl_context.load_verify_locations(CA_CERT)
-        ssl_context.check_hostname = False  # Self-signed: CN puede no coincidir
+        ssl_context.check_hostname = True
         ssl_context.verify_mode = ssl.CERT_REQUIRED
     except FileNotFoundError:
         print(f"[!] Certificado CA no encontrado: {CA_CERT}")
-        print("[!] Conectando sin verificacion de certificado (solo para pruebas).")
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
+        print("[!] Conexion cancelada por seguridad: no se permite TLS sin verificacion.")
+        print("[!] Genere/importe el certificado y vuelva a intentarlo.")
+        return
 
     # Crear socket y conexión SSL
     raw_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

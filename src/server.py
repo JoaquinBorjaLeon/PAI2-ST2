@@ -18,6 +18,7 @@ import ssl
 import threading
 import sqlite3
 import json
+import argparse
 import hashlib
 import hmac
 import os
@@ -39,6 +40,13 @@ MAX_LOGIN_ATTEMPTS = 5      # Intentos máximos antes de bloqueo
 LOCKOUT_SECONDS = 300       # 5 minutos de bloqueo por fuerza bruta
 MAX_MESSAGE_LENGTH = 144    # Longitud máxima de mensaje
 PBKDF2_ITERATIONS = 100000  # Iteraciones para derivación de clave
+PLAIN_PORT = 8080           # Puerto alternativo para benchmark sin TLS
+
+TLS13_CIPHERS = [
+    'TLS_AES_256_GCM_SHA384',
+    'TLS_CHACHA20_POLY1305_SHA256',
+    'TLS_AES_128_GCM_SHA256',
+]
 
 # Lock para operaciones de base de datos (thread-safety con SQLite)
 db_lock = threading.Lock()
@@ -379,16 +387,67 @@ def handle_client(conn, addr):
         print(f"[*] Conexión cerrada: {addr}")
 
 
-# ============================================================
-# INICIO DEL SERVIDOR
-# ============================================================
-def start_ssl_server():
-    init_database()
-
-    # Contexto SSL: forzar TLS 1.3 únicamente
+def _create_tls_context():
+    """Construye un contexto TLS 1.3 endurecido para el servidor."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+
+    # Desactivar compresión TLS reduce superficie ante ataques tipo CRIME.
+    if hasattr(ssl, 'OP_NO_COMPRESSION'):
+        ctx.options |= ssl.OP_NO_COMPRESSION
+
+    # En OpenSSL recientes, se puede fijar explícitamente el conjunto TLS 1.3.
+    if hasattr(ctx, 'set_ciphersuites'):
+        try:
+            ctx.set_ciphersuites(':'.join(TLS13_CIPHERS))
+        except (ssl.SSLError, ValueError) as e:
+            print(f"[!] Aviso: no se pudo fijar ciphersuites TLS 1.3 explícitas: {e}")
+
+    return ctx
+
+
+def _create_listen_socket(host, port):
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((host, port))
+    server_socket.listen(MAX_WORKERS)
+    return server_socket
+
+
+def _run_accept_loop(server_socket, tls_ctx=None):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        try:
+            while True:
+                client_sock, addr = server_socket.accept()
+                if tls_ctx is None:
+                    print(f"[+] TCP desde {addr} | Transporte: PLAINTEXT")
+                    pool.submit(handle_client, client_sock, addr)
+                    continue
+
+                try:
+                    ssl_conn = tls_ctx.wrap_socket(client_sock, server_side=True)
+                    negotiated_version = ssl_conn.version()
+                    ci = ssl_conn.cipher()
+                    print(f"[+] SSL desde {addr} | Cipher: {ci[0]} | Proto: {negotiated_version}")
+                    pool.submit(handle_client, ssl_conn, addr)
+                except ssl.SSLError as e:
+                    print(f"[!] Handshake SSL fallido {addr}: {e}")
+                    client_sock.close()
+        except KeyboardInterrupt:
+            print("\n[*] Servidor detenido.")
+        finally:
+            server_socket.close()
+
+
+# ============================================================
+# INICIO DEL SERVIDOR
+# ============================================================
+def start_ssl_server(host=HOST, port=PORT):
+    init_database()
+
+    # Contexto SSL: TLS 1.3 endurecido
+    ctx = _create_tls_context()
 
     try:
         ctx.load_cert_chain(certfile=CERTFILE, keyfile=KEYFILE)
@@ -400,16 +459,13 @@ def start_ssl_server():
         print(f"[!] Error SSL al cargar certificados: {e}")
         return
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen(MAX_WORKERS)
+    server_socket = _create_listen_socket(host, port)
 
     # Mostrar información del servidor
     print("=" * 60)
     print("  SERVIDOR SSL/TLS 1.3 — PAI2")
     print("=" * 60)
-    print(f"  Host:        {HOST}:{PORT}")
+    print(f"  Host:        {host}:{port}")
     print(f"  Max conexiones concurrentes: {MAX_WORKERS}")
     print(f"  Base de datos: {DB_FILE}")
     print(f"  Cipher Suites TLS 1.3:")
@@ -418,23 +474,38 @@ def start_ssl_server():
             print(f"    - {c['name']}")
     print("=" * 60)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        try:
-            while True:
-                client_sock, addr = server_socket.accept()
-                try:
-                    ssl_conn = ctx.wrap_socket(client_sock, server_side=True)
-                    ci = ssl_conn.cipher()
-                    print(f"[+] SSL desde {addr} | Cipher: {ci[0]} | Proto: {ci[1]}")
-                    pool.submit(handle_client, ssl_conn, addr)
-                except ssl.SSLError as e:
-                    print(f"[!] Handshake SSL fallido {addr}: {e}")
-                    client_sock.close()
-        except KeyboardInterrupt:
-            print("\n[*] Servidor detenido.")
-        finally:
-            server_socket.close()
+    _run_accept_loop(server_socket, tls_ctx=ctx)
+
+
+def start_plain_server(host=HOST, port=PLAIN_PORT):
+    """Servidor en texto plano solo para benchmark comparativo (sin TLS)."""
+    init_database()
+    server_socket = _create_listen_socket(host, port)
+
+    print("=" * 60)
+    print("  SERVIDOR TCP SIN TLS (SOLO BENCHMARK)")
+    print("=" * 60)
+    print(f"  Host:        {host}:{port}")
+    print(f"  Max conexiones concurrentes: {MAX_WORKERS}")
+    print(f"  Base de datos: {DB_FILE}")
+    print("=" * 60)
+
+    _run_accept_loop(server_socket, tls_ctx=None)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description='Servidor PAI2 con soporte TLS 1.3 y modo benchmark sin TLS.'
+    )
+    parser.add_argument('--plain', action='store_true', help='Inicia transporte sin TLS (solo benchmark).')
+    parser.add_argument('--host', default=HOST, help='Host de escucha.')
+    parser.add_argument('--port', type=int, default=None, help='Puerto de escucha.')
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    start_ssl_server()
+    args = _parse_args()
+    if args.plain:
+        start_plain_server(host=args.host, port=args.port or PLAIN_PORT)
+    else:
+        start_ssl_server(host=args.host, port=args.port or PORT)
